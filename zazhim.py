@@ -1,5 +1,5 @@
-"""Зажим — зажимает выбранную клавишу или кнопку мыши.
-Горячая клавиша F8 включает и отпускает зажатие из любого окна.
+"""Зажим — зажимает до трёх клавиш или кнопок мыши одновременно.
+Горячая клавиша F8 зажимает и отпускает всё сразу из любого окна.
 """
 import string
 import tkinter as tk
@@ -9,6 +9,8 @@ from pynput import keyboard, mouse
 
 kb = keyboard.Controller()
 ms = mouse.Controller()
+
+NONE = "—"
 
 KEYS = {
     "Пробел": keyboard.Key.space,
@@ -34,30 +36,33 @@ MOUSE = {
     "Мышь: средняя": mouse.Button.middle,
 }
 
-ALL = list(MOUSE) + list(KEYS)
+ALL = [NONE] + list(MOUSE) + list(KEYS)
 
 
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.holding = False
-        self.target = None  # то, что сейчас зажато
+        self.targets = []  # то, что сейчас зажато
 
         root.title("Зажим")
-        root.geometry("340x250")
+        root.geometry("340x340")
         root.resizable(False, False)
         root.attributes("-topmost", True)
 
         frm = ttk.Frame(root, padding=16)
         frm.pack(fill="both", expand=True)
 
-        ttk.Label(frm, text="Что зажимать").pack(anchor="w")
-        self.choice = ttk.Combobox(frm, values=ALL, state="readonly")
-        self.choice.set("W")
-        self.choice.pack(fill="x", pady=(2, 10))
+        self.choices = []
+        for i, default in enumerate(["W", NONE, NONE], start=1):
+            ttk.Label(frm, text=f"Кнопка {i}").pack(anchor="w")
+            box = ttk.Combobox(frm, values=ALL, state="readonly")
+            box.set(default)
+            box.pack(fill="x", pady=(2, 8))
+            self.choices.append(box)
 
         row = ttk.Frame(frm)
-        row.pack(fill="x", pady=(0, 12))
+        row.pack(fill="x", pady=(2, 12))
         ttk.Label(row, text="Задержка перед зажатием, с").pack(side="left")
         self.delay = tk.IntVar(value=3)
         ttk.Spinbox(row, from_=0, to=30, width=4, textvariable=self.delay).pack(side="right")
@@ -77,41 +82,55 @@ class App:
     def toggle(self):
         if self.holding:
             self.release()
+            return
+        if not self.selected():
+            self.status.config(text="Выберите хотя бы одну кнопку", foreground="#b00020")
+            return
+        wait = max(0, self.delay.get())
+        self.btn.config(state="disabled")
+        if wait:
+            self.countdown(wait)
         else:
-            wait = max(0, self.delay.get())
-            self.btn.config(state="disabled")
-            if wait:
-                self.countdown(wait)
-            else:
-                self.press()
+            self.press()
+
+    def selected(self):
+        names = []
+        for box in self.choices:
+            name = box.get()
+            if name != NONE and name not in names:
+                names.append(name)
+        return names
 
     def countdown(self, left):
         if left == 0:
             self.press()
             return
-        self.status.config(text=f"Зажму через {left} с — переключитесь в нужное окно")
+        self.status.config(text=f"Зажму через {left} с — переключитесь в нужное окно", foreground="#666")
         self.root.after(1000, lambda: self.countdown(left - 1))
 
     def press(self):
-        name = self.choice.get()
-        if name in MOUSE:
-            self.target = MOUSE[name]
-            ms.press(self.target)
-        else:
-            self.target = KEYS[name]
-            kb.press(self.target)
+        names = self.selected()
+        self.targets = []
+        for name in names:
+            if name in MOUSE:
+                target = MOUSE[name]
+                ms.press(target)
+            else:
+                target = KEYS[name]
+                kb.press(target)
+            self.targets.append(target)
         self.holding = True
         self.btn.config(text="Отпустить (F8)", state="normal")
-        self.status.config(text=f"Зажато: {name}", foreground="#0a7d33")
+        self.status.config(text="Зажато: " + ", ".join(names), foreground="#0a7d33")
 
     def release(self):
-        if self.target is not None:
-            if isinstance(self.target, mouse.Button):
-                ms.release(self.target)
+        for target in self.targets:
+            if isinstance(target, mouse.Button):
+                ms.release(target)
             else:
-                kb.release(self.target)
+                kb.release(target)
+        self.targets = []
         self.holding = False
-        self.target = None
         self.btn.config(text="Зажать (F8)", state="normal")
         self.status.config(text="Отпущено", foreground="#666")
 
