@@ -2,7 +2,9 @@
 Вкладка «Зажим»: держит до трёх клавиш или кнопок мыши (F8).
 Вкладка «Макрос»: записывает движения мыши и нажатия, потом повторяет (F9 запись, F10 пуск/стоп).
 Вкладка «Курсор 2»: метка «второго курсора» на экране и мгновенный переброс мыши между двумя местами (F6 создать, F7 переключить).
+Вкладка «Экран»: ищет на экране выбранные кнопки (например «Play again») и нажимает на них или запускает макрос (F11 старт/стоп).
 """
+import base64
 import ctypes
 import os
 import string
@@ -16,6 +18,15 @@ from ctypes import wintypes
 from tkinter import ttk
 
 from pynput import keyboard, mouse
+
+# Поиск по экрану. Если модулей нет, не работает только вкладка «Экран», остальное открывается как раньше.
+try:
+    import cv2
+    import mss
+    import numpy as np
+    SCREEN_OK = True
+except Exception:
+    SCREEN_OK = False
 
 # Windows: одинаковые координаты мыши при записи и воспроизведении на экранах с масштабом
 try:
@@ -35,7 +46,8 @@ kb = keyboard.Controller()
 ms = mouse.Controller()
 
 NONE = "—"
-HOTKEYS = (keyboard.Key.f6, keyboard.Key.f7, keyboard.Key.f8, keyboard.Key.f9, keyboard.Key.f10)
+HOTKEYS = (keyboard.Key.f6, keyboard.Key.f7, keyboard.Key.f8, keyboard.Key.f9, keyboard.Key.f10,
+           keyboard.Key.f11)
 
 KEYS = {
     "Пробел": keyboard.Key.space,
@@ -50,7 +62,7 @@ KEYS = {
     "Стрелка вправо": keyboard.Key.right,
 }
 for n in range(1, 13):
-    if n not in (6, 7, 8, 9, 10):  # F6–F10 заняты горячими клавишами
+    if n not in (6, 7, 8, 9, 10, 11):  # F6–F11 заняты горячими клавишами
         KEYS[f"F{n}"] = getattr(keyboard.Key, f"f{n}")
 for ch in string.ascii_lowercase + string.digits:
     KEYS[ch.upper()] = ch
@@ -207,6 +219,76 @@ def play_events(events, repeats, speed, pause, stop, on_loop=None, mode=MODE_NOR
             except Exception:
                 pass
     return loops
+
+
+# ---------- поиск кнопок на экране (без интерфейса, чтобы можно было проверять отдельно) ----------
+
+ACT_CLICK = "Клик"
+ACT_MACRO = "Макрос"
+ACT_BOTH = "Клик + макрос"
+
+
+def grab_screen():
+    """Снимок всего экрана (все мониторы). Возвращает (картинка BGR, left, top)."""
+    with mss.mss() as sct:  # mss создаётся в том потоке, где снимаем: так он работает надёжно
+        mon = sct.monitors[0]
+        shot = np.array(sct.grab(mon))
+    return np.ascontiguousarray(shot[:, :, :3]), mon["left"], mon["top"]
+
+
+def best_match(screen, tpl):
+    """Насколько картинка tpl похожа на лучшее место экрана: (сходство 0..1, (центр x, центр y))."""
+    th, tw = tpl.shape[:2]
+    sh, sw = screen.shape[:2]
+    if th > sh or tw > sw:
+        return 0.0, (0, 0)
+    res = cv2.matchTemplate(screen, tpl, cv2.TM_CCOEFF_NORMED)
+    _, score, _, loc = cv2.minMaxLoc(res)
+    if score != score:  # NaN у однотонных картинок
+        score = 0.0
+    return float(score), (loc[0] + tw // 2, loc[1] + th // 2)
+
+
+def click_at(x, y, mode=MODE_GAME):
+    move_cursor(x, y, mode)
+    time.sleep(SETTLE)
+    ms.press(mouse.Button.left)
+    time.sleep(MIN_HOLD)
+    ms.release(mouse.Button.left)
+
+
+def scan_loop(rules, threshold, interval, cooldown, stop, info,
+              macro_events, macro_mode, grab=None, click=None):
+    """Каждые interval секунд смотрит на экран. Нашла кнопку: кликает и/или запускает макрос.
+    После действия для этой кнопки cooldown секунд пауза, чтобы не кликать по одной и той же дважды."""
+    grab = grab or grab_screen
+    click = click or click_at
+    last = {}
+    while not stop.is_set():
+        try:
+            screen, left, top = grab()
+        except Exception as exc:
+            info["msg"] = f"Не удалось снять экран: {exc}"
+            stop.wait(1.0)
+            continue
+        for i, rule in enumerate(rules):
+            if time.perf_counter() - last.get(i, -1e9) < cooldown:
+                continue
+            score, (cx, cy) = best_match(screen, rule["tpl"])
+            if score < threshold:
+                continue
+            info["msg"] = f"Нашла «{rule['name']}» (сходство {score:.2f})"
+            try:
+                if rule["action"] in (ACT_CLICK, ACT_BOTH):
+                    click(left + cx, top + cy)
+                if rule["action"] in (ACT_MACRO, ACT_BOTH) and macro_events:
+                    play_events(list(macro_events), 1, 1.0, 0.0, stop, None, macro_mode)
+            except Exception as exc:
+                info["msg"] = f"Ошибка действия: {exc}"
+            last[i] = time.perf_counter()
+            info["hits"] = info.get("hits", 0) + 1
+            break  # экран после действия изменился: снимаем заново
+        stop.wait(interval)
 
 
 # ---------- вкладка «Зажим» ----------
@@ -625,11 +707,224 @@ class CursorTab:
         self.root.after(500, self.keep_visible)
 
 
+# ---------- вкладка «Экран» ----------
+
+class ScreenTab:
+    def __init__(self, root, parent, get_macro=None):
+        if not SCREEN_OK:
+            raise RuntimeError("не загрузились модули поиска по экрану (cv2, numpy, mss)")
+        self.root = root
+        self.get_macro = get_macro or (lambda: None)
+        self.rules = []  # {"name", "tpl", "action"}
+        self.state = "idle"  # idle / arming / scanning
+        self.thread = None
+        self.stop_scan = threading.Event()
+        self.info = {"msg": "", "hits": 0}
+
+        frm = ttk.Frame(parent, padding=12)
+        frm.pack(fill="both", expand=True)
+
+        ttk.Label(frm, text="Что делать, когда кнопка найдена").pack(anchor="w")
+        self.action = tk.StringVar(value=ACT_CLICK)
+        ttk.Combobox(frm, values=[ACT_CLICK, ACT_MACRO, ACT_BOTH], state="readonly",
+                     textvariable=self.action).pack(fill="x", pady=(2, 6))
+        ttk.Button(frm, text="Добавить кнопку с экрана", command=self.add_rule).pack(fill="x", ipady=4)
+
+        self.listbox = tk.Listbox(frm, height=4, exportselection=False)
+        self.listbox.pack(fill="x", pady=6)
+        ttk.Button(frm, text="Удалить выбранную", command=self.remove_rule).pack(fill="x")
+
+        self.threshold_var = tk.DoubleVar(value=0.85)
+        self.interval_var = tk.DoubleVar(value=0.5)
+        self.cooldown_var = tk.DoubleVar(value=3.0)
+        for text, widget in (
+            ("Точность совпадения (0.5–0.99)", ttk.Spinbox(frm, from_=0.5, to=0.99, increment=0.01, width=6,
+                                                          textvariable=self.threshold_var)),
+            ("Проверять каждые, с", ttk.Spinbox(frm, from_=0.2, to=60, increment=0.1, width=6,
+                                               textvariable=self.interval_var)),
+            ("Пауза после действия, с", ttk.Spinbox(frm, from_=0, to=600, increment=1, width=6,
+                                                   textvariable=self.cooldown_var)),
+        ):
+            row = ttk.Frame(frm)
+            row.pack(fill="x", pady=2)
+            ttk.Label(row, text=text).pack(side="left")
+            widget.pack(side="right")
+
+        self.start_btn = ttk.Button(frm, text="Старт поиска (F11)", command=lambda: self.toggle_scan(True))
+        self.start_btn.pack(fill="x", ipady=6, pady=(8, 4))
+        ttk.Button(frm, text="Проверить сейчас (без клика)", command=self.check_once).pack(fill="x")
+
+        self.status = ttk.Label(frm, text="Добавьте кнопку, которую нужно искать", foreground="#666",
+                                wraplength=310)
+        self.status.pack(pady=(8, 0))
+        self.tick()
+
+    # --- настройки ---
+    @staticmethod
+    def number(var, default):
+        try:
+            return float(var.get())
+        except (tk.TclError, ValueError):
+            return default
+
+    def refresh_list(self):
+        self.listbox.delete(0, "end")
+        for i, rule in enumerate(self.rules, start=1):
+            self.listbox.insert("end", f"{i}. {rule['name']}: {rule['action']}")
+
+    def remove_rule(self):
+        sel = self.listbox.curselection()
+        if sel and self.state == "idle":
+            del self.rules[sel[0]]
+            self.refresh_list()
+
+    def finish(self, text, color="#666"):
+        self.state = "idle"
+        self.root.deiconify()
+        self.status.config(text=text, foreground=color)
+
+    # --- выбор кнопки на экране ---
+    def add_rule(self):
+        if self.state != "idle":
+            return
+        self.state = "arming"
+        self.root.iconify()
+        self.root.after(600, self.pick_region)
+
+    def pick_region(self):
+        try:
+            img, left, top = grab_screen()
+            h, w = img.shape[:2]
+            ok, png = cv2.imencode(".png", img)
+            photo = tk.PhotoImage(data=base64.b64encode(png.tobytes()))
+        except Exception as exc:
+            self.finish(f"Не удалось снять экран: {exc}", "#b00020")
+            return
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.geometry(f"{w}x{h}+{left}+{top}")
+        cv = tk.Canvas(win, width=w, height=h, highlightthickness=0, cursor="crosshair")
+        cv.pack()
+        cv.create_image(0, 0, image=photo, anchor="nw")
+        cv.photo = photo
+        cv.create_rectangle(w // 2 - 300, 14, w // 2 + 300, 50, fill="black", outline="")
+        cv.create_text(w // 2, 32, fill="yellow",
+                       text="Обведите кнопку рамкой (зажмите левую кнопку мыши). Правая кнопка или Esc: отмена")
+        start, box = {}, {"id": None}
+        action = self.action.get()
+
+        def press(e):
+            start["x"], start["y"] = e.x, e.y
+            box["id"] = cv.create_rectangle(e.x, e.y, e.x, e.y, outline="#ffeb3b", width=2)
+
+        def drag(e):
+            if box["id"]:
+                cv.coords(box["id"], start["x"], start["y"], e.x, e.y)
+
+        def release(e):
+            if "x" not in start:
+                return
+            x0, x1 = sorted((start["x"], e.x))
+            y0, y1 = sorted((start["y"], e.y))
+            x0, y0 = max(x0, 0), max(y0, 0)
+            x1, y1 = min(x1, w), min(y1, h)
+            win.destroy()
+            if x1 - x0 < 12 or y1 - y0 < 8:
+                self.finish("Рамка слишком маленькая. Попробуйте ещё раз", "#b00020")
+                return
+            tpl = img[y0:y1, x0:x1].copy()
+            if float(tpl.std()) < 3:
+                self.finish("Область однотонная, по ней не найти. Обведите кнопку вместе с текстом или рамкой",
+                            "#b00020")
+                return
+            name = f"Кнопка {len(self.rules) + 1}"
+            self.rules.append({"name": name, "tpl": tpl, "action": action})
+            self.refresh_list()
+            self.finish(f"Добавлено: {name} ({x1 - x0}×{y1 - y0} px). Нажмите «Проверить сейчас»", "#0a7d33")
+
+        def cancel(e=None):
+            win.destroy()
+            self.finish("Отменено")
+
+        cv.bind("<ButtonPress-1>", press)
+        cv.bind("<B1-Motion>", drag)
+        cv.bind("<ButtonRelease-1>", release)
+        cv.bind("<ButtonPress-3>", cancel)
+        win.bind("<Escape>", cancel)
+        win.focus_force()
+
+    # --- проверка без клика ---
+    def check_once(self):
+        if self.state != "idle":
+            return
+        if not self.rules:
+            self.status.config(text="Сначала добавьте кнопку", foreground="#b00020")
+            return
+        self.state = "arming"
+        self.root.iconify()
+        self.root.after(700, self.run_check)
+
+    def run_check(self):
+        try:
+            screen, _, _ = grab_screen()
+            parts = [f"{r['name']}: {best_match(screen, r['tpl'])[0]:.2f}" for r in self.rules]
+            text = ("Сходство: " + "; ".join(parts) +
+                    f". Порог: {self.number(self.threshold_var, 0.85):.2f}. "
+                    "Если кнопка на экране, а сходство ниже порога, уменьшите точность")
+            color = "#0a7d33"
+        except Exception as exc:
+            text, color = f"Ошибка проверки: {exc}", "#b00020"
+        self.finish(text, color)
+
+    # --- поиск ---
+    def toggle_scan(self, from_button=False):
+        if self.state == "scanning":
+            self.stop_scan.set()
+        elif self.state == "idle":
+            if not self.rules:
+                self.status.config(text="Сначала добавьте кнопку", foreground="#b00020")
+                return
+            self.state = "arming"
+            self.root.iconify()  # окно программы не должно закрывать кнопку на экране
+            self.root.after(800 if from_button else 0, self.begin_scan)
+
+    def begin_scan(self):
+        macro = self.get_macro()
+        events = list(macro.events) if macro is not None else []
+        mode = macro.mode.get() if macro is not None else MODE_GAME
+        self.info = {"msg": "Ищу...", "hits": 0}
+        self.stop_scan.clear()
+        self.thread = threading.Thread(
+            target=scan_loop,
+            args=(list(self.rules), self.number(self.threshold_var, 0.85),
+                  max(0.2, self.number(self.interval_var, 0.5)), max(0.0, self.number(self.cooldown_var, 3.0)),
+                  self.stop_scan, self.info, events, mode),
+            daemon=True,
+        )
+        self.state = "scanning"
+        self.thread.start()
+        self.start_btn.config(text="Стоп поиска (F11)")
+
+    def tick(self):
+        if self.state == "scanning":
+            if self.thread is not None and not self.thread.is_alive():
+                self.start_btn.config(text="Старт поиска (F11)")
+                self.finish(f"Поиск остановлен. Срабатываний: {self.info.get('hits', 0)}", "#0a7d33")
+            else:
+                self.status.config(text=f"Идёт поиск. Срабатываний: {self.info.get('hits', 0)}. "
+                                        f"{self.info.get('msg', '')} Остановить: F11", foreground="#0a7d33")
+        self.root.after(200, self.tick)
+
+    def shutdown(self):
+        self.stop_scan.set()
+
+
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title("Зажим")
-        root.geometry("360x490")
+        root.geometry("360x560")
         root.resizable(False, False)
         root.attributes("-topmost", True)
 
@@ -639,6 +934,7 @@ class App:
         self.hold = self.make_tab(nb, "Зажим", HoldTab)
         self.macro = self.make_tab(nb, "Макрос", MacroTab)
         self.cursor = self.make_tab(nb, "Курсор 2", CursorTab)
+        self.screen = self.make_tab(nb, "Экран", lambda r, f: ScreenTab(r, f, lambda: self.macro))
 
         # Глобальные горячие клавиши работают из любого окна
         self.hotkeys = None
@@ -649,6 +945,7 @@ class App:
                 "<f8>": self.hot(self.hold, "toggle"),
                 "<f9>": self.hot(self.macro, "toggle_record"),
                 "<f10>": self.hot(self.macro, "toggle_play"),
+                "<f11>": self.hot(self.screen, "toggle_scan"),
             })
             self.hotkeys.start()
         except Exception:
@@ -681,6 +978,8 @@ class App:
                 self.hold.release()
             if self.macro is not None:
                 self.macro.shutdown()
+            if self.screen is not None:
+                self.screen.shutdown()
             if self.hotkeys is not None:
                 self.hotkeys.stop()
         except Exception:
