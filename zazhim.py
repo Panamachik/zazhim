@@ -2,7 +2,7 @@
 Вкладка «Зажим»: держит до трёх клавиш или кнопок мыши (F8).
 Вкладка «Макрос»: записывает движения мыши и нажатия, потом повторяет (F9 запись, F10 пуск/стоп).
 Вкладка «Курсор 2»: метка «второго курсора» на экране и мгновенный переброс мыши между двумя местами (F6 создать, F7 переключить).
-Вкладка «Экран»: ищет на экране выбранные кнопки (например «Play again») и нажимает на них или запускает макрос (F11 старт/стоп).
+Вкладка «Экран»: ищет на экране выбранные кнопки (например «Play again») и сразу нажимает на них (F11 старт/стоп).
 """
 import base64
 import ctypes
@@ -223,9 +223,7 @@ def play_events(events, repeats, speed, pause, stop, on_loop=None, mode=MODE_NOR
 
 # ---------- поиск кнопок на экране (без интерфейса, чтобы можно было проверять отдельно) ----------
 
-ACT_CLICK = "Клик"
-ACT_MACRO = "Макрос"
-ACT_BOTH = "Клик + макрос"
+CLICK_HOLD = 0.03  # сколько держим кнопку мыши при клике по найденной кнопке, с
 
 
 def grab_screen():
@@ -249,20 +247,21 @@ def best_match(screen, tpl):
     return float(score), (loc[0] + tw // 2, loc[1] + th // 2)
 
 
-def click_at(x, y, mode=MODE_GAME):
+def click_at(x, y, delay=0.0, mode=MODE_GAME):
+    """Наводит мышь на (x, y) и сразу кликает. delay — необязательная пауза между наведением и кликом."""
     move_cursor(x, y, mode)
-    time.sleep(SETTLE)
+    if delay > 0:
+        time.sleep(delay)
     ms.press(mouse.Button.left)
-    time.sleep(MIN_HOLD)
+    time.sleep(CLICK_HOLD)
     ms.release(mouse.Button.left)
 
 
-def scan_loop(rules, threshold, interval, cooldown, stop, info,
-              macro_events, macro_mode, grab=None, click=None):
-    """Каждые interval секунд смотрит на экран. Нашла кнопку: кликает и/или запускает макрос.
-    После действия для этой кнопки cooldown секунд пауза, чтобы не кликать по одной и той же дважды."""
+def scan_loop(rules, threshold, interval, cooldown, stop, info, click_delay=0.0, grab=None, click=None):
+    """Каждые interval секунд смотрит на экран. Нашла кнопку: сразу наводит мышь и кликает.
+    После клика cooldown секунд пауза для этой кнопки, чтобы не кликать по одной и той же дважды."""
     grab = grab or grab_screen
-    click = click or click_at
+    click = click or (lambda x, y: click_at(x, y, click_delay))
     last = {}
     while not stop.is_set():
         try:
@@ -277,17 +276,14 @@ def scan_loop(rules, threshold, interval, cooldown, stop, info,
             score, (cx, cy) = best_match(screen, rule["tpl"])
             if score < threshold:
                 continue
-            info["msg"] = f"Нашла «{rule['name']}» (сходство {score:.2f})"
+            info["msg"] = f"Нажала «{rule['name']}» (сходство {score:.2f})"
             try:
-                if rule["action"] in (ACT_CLICK, ACT_BOTH):
-                    click(left + cx, top + cy)
-                if rule["action"] in (ACT_MACRO, ACT_BOTH) and macro_events:
-                    play_events(list(macro_events), 1, 1.0, 0.0, stop, None, macro_mode)
+                click(left + cx, top + cy)
             except Exception as exc:
-                info["msg"] = f"Ошибка действия: {exc}"
+                info["msg"] = f"Ошибка клика: {exc}"
             last[i] = time.perf_counter()
             info["hits"] = info.get("hits", 0) + 1
-            break  # экран после действия изменился: снимаем заново
+            break  # экран после клика изменился: снимаем заново
         stop.wait(interval)
 
 
@@ -710,12 +706,11 @@ class CursorTab:
 # ---------- вкладка «Экран» ----------
 
 class ScreenTab:
-    def __init__(self, root, parent, get_macro=None):
+    def __init__(self, root, parent):
         if not SCREEN_OK:
             raise RuntimeError("не загрузились модули поиска по экрану (cv2, numpy, mss)")
         self.root = root
-        self.get_macro = get_macro or (lambda: None)
-        self.rules = []  # {"name", "tpl", "action"}
+        self.rules = []  # {"name", "tpl"}
         self.state = "idle"  # idle / arming / scanning
         self.thread = None
         self.stop_scan = threading.Event()
@@ -724,10 +719,6 @@ class ScreenTab:
         frm = ttk.Frame(parent, padding=12)
         frm.pack(fill="both", expand=True)
 
-        ttk.Label(frm, text="Что делать, когда кнопка найдена").pack(anchor="w")
-        self.action = tk.StringVar(value=ACT_CLICK)
-        ttk.Combobox(frm, values=[ACT_CLICK, ACT_MACRO, ACT_BOTH], state="readonly",
-                     textvariable=self.action).pack(fill="x", pady=(2, 6))
         ttk.Button(frm, text="Добавить кнопку с экрана", command=self.add_rule).pack(fill="x", ipady=4)
 
         self.listbox = tk.Listbox(frm, height=4, exportselection=False)
@@ -735,15 +726,18 @@ class ScreenTab:
         ttk.Button(frm, text="Удалить выбранную", command=self.remove_rule).pack(fill="x")
 
         self.threshold_var = tk.DoubleVar(value=0.85)
-        self.interval_var = tk.DoubleVar(value=0.5)
+        self.interval_var = tk.DoubleVar(value=0.2)
         self.cooldown_var = tk.DoubleVar(value=3.0)
+        self.delay_var = tk.DoubleVar(value=0.0)
         for text, widget in (
             ("Точность совпадения (0.5–0.99)", ttk.Spinbox(frm, from_=0.5, to=0.99, increment=0.01, width=6,
                                                           textvariable=self.threshold_var)),
             ("Проверять каждые, с", ttk.Spinbox(frm, from_=0.2, to=60, increment=0.1, width=6,
                                                textvariable=self.interval_var)),
-            ("Пауза после действия, с", ttk.Spinbox(frm, from_=0, to=600, increment=1, width=6,
-                                                   textvariable=self.cooldown_var)),
+            ("Пауза после клика, с", ttk.Spinbox(frm, from_=0, to=600, increment=1, width=6,
+                                                textvariable=self.cooldown_var)),
+            ("Задержка перед кликом, мс", ttk.Spinbox(frm, from_=0, to=500, increment=10, width=6,
+                                                      textvariable=self.delay_var)),
         ):
             row = ttk.Frame(frm)
             row.pack(fill="x", pady=2)
@@ -770,7 +764,7 @@ class ScreenTab:
     def refresh_list(self):
         self.listbox.delete(0, "end")
         for i, rule in enumerate(self.rules, start=1):
-            self.listbox.insert("end", f"{i}. {rule['name']}: {rule['action']}")
+            self.listbox.insert("end", f"{i}. {rule['name']}")
 
     def remove_rule(self):
         sel = self.listbox.curselection()
@@ -812,7 +806,6 @@ class ScreenTab:
         cv.create_text(w // 2, 32, fill="yellow",
                        text="Обведите кнопку рамкой (зажмите левую кнопку мыши). Правая кнопка или Esc: отмена")
         start, box = {}, {"id": None}
-        action = self.action.get()
 
         def press(e):
             start["x"], start["y"] = e.x, e.y
@@ -839,7 +832,7 @@ class ScreenTab:
                             "#b00020")
                 return
             name = f"Кнопка {len(self.rules) + 1}"
-            self.rules.append({"name": name, "tpl": tpl, "action": action})
+            self.rules.append({"name": name, "tpl": tpl})
             self.refresh_list()
             self.finish(f"Добавлено: {name} ({x1 - x0}×{y1 - y0} px). Нажмите «Проверить сейчас»", "#0a7d33")
 
@@ -890,16 +883,13 @@ class ScreenTab:
             self.root.after(800 if from_button else 0, self.begin_scan)
 
     def begin_scan(self):
-        macro = self.get_macro()
-        events = list(macro.events) if macro is not None else []
-        mode = macro.mode.get() if macro is not None else MODE_GAME
         self.info = {"msg": "Ищу...", "hits": 0}
         self.stop_scan.clear()
         self.thread = threading.Thread(
             target=scan_loop,
             args=(list(self.rules), self.number(self.threshold_var, 0.85),
-                  max(0.2, self.number(self.interval_var, 0.5)), max(0.0, self.number(self.cooldown_var, 3.0)),
-                  self.stop_scan, self.info, events, mode),
+                  max(0.2, self.number(self.interval_var, 0.2)), max(0.0, self.number(self.cooldown_var, 3.0)),
+                  self.stop_scan, self.info, max(0.0, self.number(self.delay_var, 0.0)) / 1000.0),
             daemon=True,
         )
         self.state = "scanning"
@@ -934,7 +924,7 @@ class App:
         self.hold = self.make_tab(nb, "Зажим", HoldTab)
         self.macro = self.make_tab(nb, "Макрос", MacroTab)
         self.cursor = self.make_tab(nb, "Курсор 2", CursorTab)
-        self.screen = self.make_tab(nb, "Экран", lambda r, f: ScreenTab(r, f, lambda: self.macro))
+        self.screen = self.make_tab(nb, "Экран", ScreenTab)
 
         # Глобальные горячие клавиши работают из любого окна
         self.hotkeys = None
